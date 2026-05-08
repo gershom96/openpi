@@ -1,3 +1,4 @@
+from collections.abc import Callable
 import dataclasses
 import logging
 
@@ -15,6 +16,9 @@ from openpi.shared import array_typing as at
 import openpi.shared.nnx_utils as nnx_utils
 
 logger = logging.getLogger("openpi")
+
+
+ActionAdapterFactory = Callable[[int, int, int, bool, nnx.Rngs], nnx.Module]
 
 
 def make_attn_mask(input_mask, mask_ar):
@@ -80,6 +84,10 @@ class Pi0Config(_model.BaseModelConfig):
     pi05: bool = False
     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
     discrete_state_input: bool = None  # type: ignore
+    # Optional factory for swapping the action projection/timestep adapter while keeping the transformer
+    # backbone intact.
+    # Signature: (action_dim, action_horizon, action_expert_width, pi05, rngs) -> nnx.Module.
+    action_adapter_factory: ActionAdapterFactory | None = None
 
     def __post_init__(self):
         if self.max_token_len is None:
@@ -181,15 +189,27 @@ class Pi0(_model.BaseModel):
         )
         img.lazy_init(next(iter(config.fake_obs().images.values())), train=False, rngs=rngs)
         self.PaliGemma = nnx.Dict(llm=llm, img=img)
-        self.action_in_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
-        if config.pi05:
-            self.time_mlp_in = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
-            self.time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
+        if config.action_adapter_factory is not None:
+            self.action_adapter = config.action_adapter_factory(
+                config.action_dim,
+                config.action_horizon,
+                action_expert_config.width,
+                config.pi05,
+                rngs,
+            )
         else:
-            self.state_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
-            self.action_time_mlp_in = nnx.Linear(2 * action_expert_config.width, action_expert_config.width, rngs=rngs)
-            self.action_time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
-        self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
+            self.action_adapter = None
+            self.action_in_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
+            if config.pi05:
+                self.time_mlp_in = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
+                self.time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
+            else:
+                self.state_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
+                self.action_time_mlp_in = nnx.Linear(
+                    2 * action_expert_config.width, action_expert_config.width, rngs=rngs
+                )
+                self.action_time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
+            self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
 
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True
@@ -240,34 +260,37 @@ class Pi0(_model.BaseModel):
         input_mask = []
         ar_mask = []
         tokens = []
-        if not self.pi05:
-            # add a single state token
-            state_token = self.state_proj(obs.state)[:, None, :]
-            tokens.append(state_token)
-            input_mask.append(jnp.ones((obs.state.shape[0], 1), dtype=jnp.bool_))
-            # image/language inputs do not attend to state or actions
-            ar_mask += [True]
-
-        action_tokens = self.action_in_proj(noisy_actions)
-        # embed timestep using sine-cosine positional encoding with sensitivity in the range [0, 1]
-        time_emb = posemb_sincos(timestep, self.action_in_proj.out_features, min_period=4e-3, max_period=4.0)
-        if self.pi05:
-            # time MLP (for adaRMS)
-            time_emb = self.time_mlp_in(time_emb)
-            time_emb = nnx.swish(time_emb)
-            time_emb = self.time_mlp_out(time_emb)
-            time_emb = nnx.swish(time_emb)
-            action_expert_tokens = action_tokens
-            adarms_cond = time_emb
+        if self.action_adapter is not None:
+            action_expert_tokens, adarms_cond = self.action_adapter.embed(noisy_actions, timestep)
         else:
-            # mix timestep + action information using an MLP (no adaRMS)
-            time_tokens = einops.repeat(time_emb, "b emb -> b s emb", s=self.action_horizon)
-            action_time_tokens = jnp.concatenate([action_tokens, time_tokens], axis=-1)
-            action_time_tokens = self.action_time_mlp_in(action_time_tokens)
-            action_time_tokens = nnx.swish(action_time_tokens)
-            action_time_tokens = self.action_time_mlp_out(action_time_tokens)
-            action_expert_tokens = action_time_tokens
-            adarms_cond = None
+            action_tokens = self.action_in_proj(noisy_actions)
+            # embed timestep using sine-cosine positional encoding with sensitivity in the range [0, 1]
+            time_emb = posemb_sincos(timestep, self.action_in_proj.out_features, min_period=4e-3, max_period=4.0)
+
+            if self.pi05:
+                # time MLP (for adaRMS)
+                time_emb = self.time_mlp_in(time_emb)
+                time_emb = nnx.swish(time_emb)
+                time_emb = self.time_mlp_out(time_emb)
+                time_emb = nnx.swish(time_emb)
+                action_expert_tokens = action_tokens
+                adarms_cond = time_emb
+            else:
+                # add a single state token
+                state_token = self.state_proj(obs.state)[:, None, :]
+                tokens.append(state_token)
+                input_mask.append(jnp.ones((obs.state.shape[0], 1), dtype=jnp.bool_))
+                # image/language inputs do not attend to state or actions
+                ar_mask += [True]
+
+                # mix timestep + action information using an MLP (no adaRMS)
+                time_tokens = einops.repeat(time_emb, "b emb -> b s emb", s=self.action_horizon)
+                action_time_tokens = jnp.concatenate([action_tokens, time_tokens], axis=-1)
+                action_time_tokens = self.action_time_mlp_in(action_time_tokens)
+                action_time_tokens = nnx.swish(action_time_tokens)
+                action_time_tokens = self.action_time_mlp_out(action_time_tokens)
+                action_expert_tokens = action_time_tokens
+                adarms_cond = None
         tokens.append(action_expert_tokens)
         input_mask.append(jnp.ones(action_expert_tokens.shape[:2], dtype=jnp.bool_))
         # image/language/state inputs do not attend to action tokens
@@ -276,6 +299,11 @@ class Pi0(_model.BaseModel):
         input_mask = jnp.concatenate(input_mask, axis=1)
         ar_mask = jnp.array(ar_mask)
         return tokens, input_mask, ar_mask, adarms_cond
+
+    def decode_actions(self, action_hidden: at.Float[at.Array, "b s emb"]) -> _model.Actions:
+        if self.action_adapter is not None:
+            return self.action_adapter.decode(action_hidden)
+        return self.action_out_proj(action_hidden)
 
     @override
     def compute_loss(
@@ -301,7 +329,7 @@ class Pi0(_model.BaseModel):
         (prefix_out, suffix_out), _ = self.PaliGemma.llm(
             [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions, adarms_cond=[None, adarms_cond]
         )
-        v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+        v_t = self.decode_actions(suffix_out[:, -self.action_horizon :])
 
         return jnp.mean(jnp.square(v_t - u_t), axis=-1)
 
@@ -356,7 +384,7 @@ class Pi0(_model.BaseModel):
                 adarms_cond=[None, adarms_cond],
             )
             assert prefix_out is None
-            v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+            v_t = self.decode_actions(suffix_out[:, -self.action_horizon :])
 
             return x_t + dt * v_t, time + dt
 
