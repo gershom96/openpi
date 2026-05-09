@@ -6,7 +6,6 @@ from typing import Protocol, SupportsIndex, TypeVar
 
 import jax
 import jax.numpy as jnp
-import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
 import numpy as np
 import torch
 
@@ -16,6 +15,17 @@ from openpi.training.droid_rlds_dataset import DroidRldsDataset
 import openpi.transforms as _transforms
 
 T_co = TypeVar("T_co", covariant=True)
+
+
+def _import_lerobot_dataset():
+    try:
+        import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
+    except ImportError as exc:
+        raise ImportError(
+            "LeRobot is only required for LeRobot-backed OpenPI datasets. "
+            "Install OpenPI with the `lerobot` extra if your config uses one."
+        ) from exc
+    return lerobot_dataset
 
 
 class Dataset(Protocol[T_co]):
@@ -136,6 +146,7 @@ def create_torch_dataset(
     if repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
 
+    lerobot_dataset = _import_lerobot_dataset()
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
