@@ -19,6 +19,7 @@ logger = logging.getLogger("openpi")
 
 
 ActionAdapterFactory = Callable[[int, int, int, bool, nnx.Rngs], nnx.Module]
+GoalAdapterFactory = Callable[[int, nnx.Rngs], nnx.Module]
 
 
 def make_attn_mask(input_mask, mask_ar):
@@ -88,6 +89,11 @@ class Pi0Config(_model.BaseModelConfig):
     # backbone intact.
     # Signature: (action_dim, action_horizon, action_expert_width, pi05, rngs) -> nnx.Module.
     action_adapter_factory: ActionAdapterFactory | None = None
+    # Optional factory for adding trainable multimodal goal-conditioning tokens to the
+    # prefix stream. Signature: (prefix_width, rngs) -> nnx.Module.
+    goal_adapter_factory: GoalAdapterFactory | None = None
+    goal_waypoint_dim: int = 2
+    max_goal_waypoints: int = 1
 
     def __post_init__(self):
         if self.max_token_len is None:
@@ -126,6 +132,16 @@ class Pi0Config(_model.BaseModelConfig):
                 state=jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32),
                 tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
                 tokenized_prompt_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),
+                goal_waypoints=(
+                    jax.ShapeDtypeStruct([batch_size, self.max_goal_waypoints, self.goal_waypoint_dim], jnp.float32)
+                    if self.goal_adapter_factory is not None
+                    else None
+                ),
+                goal_waypoint_mask=(
+                    jax.ShapeDtypeStruct([batch_size, self.max_goal_waypoints], jnp.bool_)
+                    if self.goal_adapter_factory is not None
+                    else None
+                ),
             )
         action_spec = jax.ShapeDtypeStruct([batch_size, self.action_horizon, self.action_dim], jnp.float32)
 
@@ -189,6 +205,10 @@ class Pi0(_model.BaseModel):
         )
         img.lazy_init(next(iter(config.fake_obs().images.values())), train=False, rngs=rngs)
         self.PaliGemma = nnx.Dict(llm=llm, img=img)
+        if config.goal_adapter_factory is not None:
+            self.goal_adapter = config.goal_adapter_factory(paligemma_config.width, rngs)
+        else:
+            self.goal_adapter = None
         if config.action_adapter_factory is not None:
             self.action_adapter = config.action_adapter_factory(
                 config.action_dim,
@@ -236,6 +256,19 @@ class Pi0(_model.BaseModel):
             # image tokens attend to each other
             ar_mask += [False] * image_tokens.shape[1]
 
+        # embed goal images/crops through the same SigLIP encoder as observation cameras.
+        if obs.goal_images is not None:
+            for name, image in obs.goal_images.items():
+                image_tokens, _ = self.PaliGemma.img(image, train=False)
+                tokens.append(image_tokens)
+
+                if obs.goal_image_masks is not None and name in obs.goal_image_masks:
+                    goal_image_mask = obs.goal_image_masks[name]
+                else:
+                    goal_image_mask = jnp.ones(obs.state.shape[:-1], dtype=jnp.bool_)
+                input_mask.append(einops.repeat(goal_image_mask, "b -> b s", s=image_tokens.shape[1]))
+                ar_mask += [False] * image_tokens.shape[1]
+
         # add language (aka tokenized inputs)
         if obs.tokenized_prompt is not None:
             tokenized_inputs = self.PaliGemma.llm(obs.tokenized_prompt, method="embed")
@@ -243,9 +276,18 @@ class Pi0(_model.BaseModel):
             input_mask.append(obs.tokenized_prompt_mask)
             # full attention between image and language inputs
             ar_mask += [False] * tokenized_inputs.shape[1]
+
+        if self.goal_adapter is not None:
+            goal_tokens, goal_input_mask, goal_ar_mask = self.goal_adapter.embed(obs)
+            tokens.append(goal_tokens)
+            input_mask.append(goal_input_mask)
+            # goal tokens are prefix conditioning tokens, so they use full attention
+            # with the image/text prefix rather than autoregressive action masking.
+            ar_mask = jnp.concatenate([jnp.array(ar_mask, dtype=jnp.bool_), goal_ar_mask], axis=0)
         tokens = jnp.concatenate(tokens, axis=1)
         input_mask = jnp.concatenate(input_mask, axis=1)
-        ar_mask = jnp.array(ar_mask)
+        if isinstance(ar_mask, list):
+            ar_mask = jnp.array(ar_mask)
         return tokens, input_mask, ar_mask
 
     @at.typecheck
