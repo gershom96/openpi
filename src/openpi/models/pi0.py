@@ -89,15 +89,31 @@ class Pi0(_model.BaseModel):
         )
         img.lazy_init(next(iter(config.fake_obs().images.values())), train=False, rngs=rngs)
         self.PaliGemma = nnx.Dict(llm=llm, img=img)
-        self.action_in_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
-        if config.pi05:
-            self.time_mlp_in = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
-            self.time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
+        if config.goal_adapter_factory is not None:
+            self.goal_adapter = config.goal_adapter_factory(paligemma_config.width, rngs)
         else:
-            self.state_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
-            self.action_time_mlp_in = nnx.Linear(2 * action_expert_config.width, action_expert_config.width, rngs=rngs)
-            self.action_time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
-        self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
+            self.goal_adapter = None
+        if config.action_adapter_factory is not None:
+            self.action_adapter = config.action_adapter_factory(
+                config.action_dim,
+                config.action_horizon,
+                action_expert_config.width,
+                config.pi05,
+                rngs,
+            )
+        else:
+            self.action_adapter = None
+            self.action_in_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
+            if config.pi05:
+                self.time_mlp_in = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
+                self.time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
+            else:
+                self.state_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
+                self.action_time_mlp_in = nnx.Linear(
+                    2 * action_expert_config.width, action_expert_config.width, rngs=rngs
+                )
+                self.action_time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
+            self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
 
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True
@@ -124,6 +140,19 @@ class Pi0(_model.BaseModel):
             # image tokens attend to each other
             ar_mask += [False] * image_tokens.shape[1]
 
+        # Goal images/crops are embedded through the same SigLIP encoder and appended to the prefix.
+        if obs.goal_images is not None:
+            for name, image in obs.goal_images.items():
+                image_tokens, _ = self.PaliGemma.img(image, train=False)
+                tokens.append(image_tokens)
+
+                if obs.goal_image_masks is not None and name in obs.goal_image_masks:
+                    goal_image_mask = obs.goal_image_masks[name]
+                else:
+                    goal_image_mask = jnp.ones(obs.state.shape[:-1], dtype=jnp.bool_)
+                input_mask.append(einops.repeat(goal_image_mask, "b -> b s", s=image_tokens.shape[1]))
+                ar_mask += [False] * image_tokens.shape[1]
+
         # add language (aka tokenized inputs)
         if obs.tokenized_prompt is not None:
             tokenized_inputs = self.PaliGemma.llm(obs.tokenized_prompt, method="embed")
@@ -131,9 +160,17 @@ class Pi0(_model.BaseModel):
             input_mask.append(obs.tokenized_prompt_mask)
             # full attention between image and language inputs
             ar_mask += [False] * tokenized_inputs.shape[1]
+
+        if self.goal_adapter is not None:
+            goal_tokens, goal_input_mask, goal_ar_mask = self.goal_adapter.embed(obs)
+            tokens.append(goal_tokens)
+            input_mask.append(goal_input_mask)
+            ar_mask = jnp.concatenate([jnp.array(ar_mask, dtype=jnp.bool_), goal_ar_mask], axis=0)
+
         tokens = jnp.concatenate(tokens, axis=1)
         input_mask = jnp.concatenate(input_mask, axis=1)
-        ar_mask = jnp.array(ar_mask)
+        if isinstance(ar_mask, list):
+            ar_mask = jnp.array(ar_mask)
         return tokens, input_mask, ar_mask
 
     @at.typecheck
@@ -148,34 +185,37 @@ class Pi0(_model.BaseModel):
         input_mask = []
         ar_mask = []
         tokens = []
-        if not self.pi05:
-            # add a single state token
-            state_token = self.state_proj(obs.state)[:, None, :]
-            tokens.append(state_token)
-            input_mask.append(jnp.ones((obs.state.shape[0], 1), dtype=jnp.bool_))
-            # image/language inputs do not attend to state or actions
-            ar_mask += [True]
-
-        action_tokens = self.action_in_proj(noisy_actions)
-        # embed timestep using sine-cosine positional encoding with sensitivity in the range [0, 1]
-        time_emb = posemb_sincos(timestep, self.action_in_proj.out_features, min_period=4e-3, max_period=4.0)
-        if self.pi05:
-            # time MLP (for adaRMS)
-            time_emb = self.time_mlp_in(time_emb)
-            time_emb = nnx.swish(time_emb)
-            time_emb = self.time_mlp_out(time_emb)
-            time_emb = nnx.swish(time_emb)
-            action_expert_tokens = action_tokens
-            adarms_cond = time_emb
+        if self.action_adapter is not None:
+            action_expert_tokens, adarms_cond = self.action_adapter.embed(noisy_actions, timestep)
         else:
-            # mix timestep + action information using an MLP (no adaRMS)
-            time_tokens = einops.repeat(time_emb, "b emb -> b s emb", s=self.action_horizon)
-            action_time_tokens = jnp.concatenate([action_tokens, time_tokens], axis=-1)
-            action_time_tokens = self.action_time_mlp_in(action_time_tokens)
-            action_time_tokens = nnx.swish(action_time_tokens)
-            action_time_tokens = self.action_time_mlp_out(action_time_tokens)
-            action_expert_tokens = action_time_tokens
-            adarms_cond = None
+            if not self.pi05:
+                # add a single state token
+                state_token = self.state_proj(obs.state)[:, None, :]
+                tokens.append(state_token)
+                input_mask.append(jnp.ones((obs.state.shape[0], 1), dtype=jnp.bool_))
+                # image/language inputs do not attend to state or actions
+                ar_mask += [True]
+
+            action_tokens = self.action_in_proj(noisy_actions)
+            # embed timestep using sine-cosine positional encoding with sensitivity in the range [0, 1]
+            time_emb = posemb_sincos(timestep, self.action_in_proj.out_features, min_period=4e-3, max_period=4.0)
+            if self.pi05:
+                # time MLP (for adaRMS)
+                time_emb = self.time_mlp_in(time_emb)
+                time_emb = nnx.swish(time_emb)
+                time_emb = self.time_mlp_out(time_emb)
+                time_emb = nnx.swish(time_emb)
+                action_expert_tokens = action_tokens
+                adarms_cond = time_emb
+            else:
+                # mix timestep + action information using an MLP (no adaRMS)
+                time_tokens = einops.repeat(time_emb, "b emb -> b s emb", s=self.action_horizon)
+                action_time_tokens = jnp.concatenate([action_tokens, time_tokens], axis=-1)
+                action_time_tokens = self.action_time_mlp_in(action_time_tokens)
+                action_time_tokens = nnx.swish(action_time_tokens)
+                action_time_tokens = self.action_time_mlp_out(action_time_tokens)
+                action_expert_tokens = action_time_tokens
+                adarms_cond = None
         tokens.append(action_expert_tokens)
         input_mask.append(jnp.ones(action_expert_tokens.shape[:2], dtype=jnp.bool_))
         # image/language/state inputs do not attend to action tokens
@@ -184,6 +224,11 @@ class Pi0(_model.BaseModel):
         input_mask = jnp.concatenate(input_mask, axis=1)
         ar_mask = jnp.array(ar_mask)
         return tokens, input_mask, ar_mask, adarms_cond
+
+    def decode_actions(self, action_hidden: at.Float[at.Array, "b s emb"]) -> _model.Actions:
+        if self.action_adapter is not None:
+            return self.action_adapter.decode(action_hidden)
+        return self.action_out_proj(action_hidden)
 
     @override
     def compute_loss(
@@ -209,7 +254,7 @@ class Pi0(_model.BaseModel):
         (prefix_out, suffix_out), _ = self.PaliGemma.llm(
             [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions, adarms_cond=[None, adarms_cond]
         )
-        v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+        v_t = self.decode_actions(suffix_out[:, -self.action_horizon :])
 
         return jnp.mean(jnp.square(v_t - u_t), axis=-1)
 
@@ -266,7 +311,7 @@ class Pi0(_model.BaseModel):
                 adarms_cond=[None, adarms_cond],
             )
             assert prefix_out is None
-            v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+            v_t = self.decode_actions(suffix_out[:, -self.action_horizon :])
 
             return x_t + dt * v_t, time + dt
 

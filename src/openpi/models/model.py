@@ -66,6 +66,16 @@ IMAGE_RESOLUTION = (224, 224)
 #     "state": float32[*b, s],  # Low-dimensional robot state
 #     "tokenized_prompt": int32[*b, l],  # Optional, tokenized language prompt
 #     "tokenized_prompt_mask": bool[*b, l],  # Optional, mask for tokenized prompt
+#     "goal_waypoints": float32[*b, g, d],  # Optional continuous goal waypoint tokens
+#     "goal_waypoint_mask": bool[*b, g],  # Optional mask for goal waypoint tokens
+#     "goal_image": {  # Optional goal images/crops, same image convention as observation images
+#         "crop": (float32|uint8)[*b, h, w, 3],
+#         ...
+#     },
+#     "goal_image_mask": {
+#         "crop": bool[*b],
+#         ...
+#     },
 #     "token_ar_mask": int32[*b, l],  # Optional, autoregressive mask for FAST model
 #     "token_loss_mask": bool[*b, l],  # Optional, loss mask for FAST model
 #
@@ -99,6 +109,12 @@ class Observation(Generic[ArrayT]):
     # Tokenized prompt mask.
     tokenized_prompt_mask: at.Bool[ArrayT, "*b l"] | None = None
 
+    # Optional multimodal goal conditioning fields. Goal adapters may turn these into soft prefix tokens.
+    goal_waypoints: at.Float[ArrayT, "*b g d"] | None = None
+    goal_waypoint_mask: at.Bool[ArrayT, "*b g"] | None = None
+    goal_images: dict[str, at.Float[ArrayT, "*b h w c"]] | None = None
+    goal_image_masks: dict[str, at.Bool[ArrayT, "*b"]] | None = None
+
     # pi0-fast model specific fields.
 
     # Token auto-regressive mask (for FAST autoregressive model).
@@ -118,12 +134,24 @@ class Observation(Generic[ArrayT]):
                 data["image"][key] = data["image"][key].astype(np.float32) / 255.0 * 2.0 - 1.0
             elif hasattr(data["image"][key], "dtype") and data["image"][key].dtype == torch.uint8:
                 data["image"][key] = data["image"][key].to(torch.float32).permute(0, 3, 1, 2) / 255.0 * 2.0 - 1.0
+        if data.get("goal_image") is not None:
+            for key in data["goal_image"]:
+                if data["goal_image"][key].dtype == np.uint8:
+                    data["goal_image"][key] = data["goal_image"][key].astype(np.float32) / 255.0 * 2.0 - 1.0
+                elif hasattr(data["goal_image"][key], "dtype") and data["goal_image"][key].dtype == torch.uint8:
+                    data["goal_image"][key] = (
+                        data["goal_image"][key].to(torch.float32).permute(0, 3, 1, 2) / 255.0 * 2.0 - 1.0
+                    )
         return cls(
             images=data["image"],
             image_masks=data["image_mask"],
             state=data["state"],
             tokenized_prompt=data.get("tokenized_prompt"),
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
+            goal_waypoints=data.get("goal_waypoints"),
+            goal_waypoint_mask=data.get("goal_waypoint_mask"),
+            goal_images=data.get("goal_image"),
+            goal_image_masks=data.get("goal_image_mask"),
             token_ar_mask=data.get("token_ar_mask"),
             token_loss_mask=data.get("token_loss_mask"),
         )
@@ -133,6 +161,8 @@ class Observation(Generic[ArrayT]):
         result = dataclasses.asdict(self)
         result["image"] = result.pop("images")
         result["image_mask"] = result.pop("image_masks")
+        result["goal_image"] = result.pop("goal_images")
+        result["goal_image_mask"] = result.pop("goal_image_masks")
         return result
 
 
@@ -188,6 +218,15 @@ def preprocess_observation(
 
         out_images[key] = image
 
+    out_goal_images = None
+    if observation.goal_images is not None:
+        out_goal_images = {}
+        for key, image in observation.goal_images.items():
+            if image.shape[1:3] != image_resolution:
+                logger.info(f"Resizing goal image {key} from {image.shape[1:3]} to {image_resolution}")
+                image = image_tools.resize_with_pad(image, *image_resolution)
+            out_goal_images[key] = image
+
     # obtain mask
     out_masks = {}
     for key in out_images:
@@ -203,6 +242,10 @@ def preprocess_observation(
         state=observation.state,
         tokenized_prompt=observation.tokenized_prompt,
         tokenized_prompt_mask=observation.tokenized_prompt_mask,
+        goal_waypoints=observation.goal_waypoints,
+        goal_waypoint_mask=observation.goal_waypoint_mask,
+        goal_images=out_goal_images,
+        goal_image_masks=observation.goal_image_masks,
         token_ar_mask=observation.token_ar_mask,
         token_loss_mask=observation.token_loss_mask,
     )

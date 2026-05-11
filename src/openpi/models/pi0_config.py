@@ -1,3 +1,4 @@
+from collections.abc import Callable
 import dataclasses
 from typing import TYPE_CHECKING
 
@@ -13,6 +14,10 @@ import openpi.shared.nnx_utils as nnx_utils
 
 if TYPE_CHECKING:
     from openpi.models.pi0 import Pi0
+
+
+ActionAdapterFactory = Callable[[int, int, int, bool, nnx.Rngs], nnx.Module]
+GoalAdapterFactory = Callable[[int, nnx.Rngs], nnx.Module]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -31,6 +36,15 @@ class Pi0Config(_model.BaseModelConfig):
     pi05: bool = False
     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
     discrete_state_input: bool = None  # type: ignore
+    # Optional factory for swapping the action projection/timestep adapter while keeping the transformer
+    # backbone intact.
+    # Signature: (action_dim, action_horizon, action_expert_width, pi05, rngs) -> nnx.Module.
+    action_adapter_factory: ActionAdapterFactory | None = None
+    # Optional factory for adding trainable multimodal goal-conditioning tokens to the prefix stream.
+    # Signature: (prefix_width, rngs) -> nnx.Module.
+    goal_adapter_factory: GoalAdapterFactory | None = None
+    goal_waypoint_dim: int = 2
+    max_goal_waypoints: int = 1
 
     pytorch_compile_mode: str | None = "max-autotune"
 
@@ -80,6 +94,16 @@ class Pi0Config(_model.BaseModelConfig):
                 state=jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32),
                 tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
                 tokenized_prompt_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),
+                goal_waypoints=(
+                    jax.ShapeDtypeStruct([batch_size, self.max_goal_waypoints, self.goal_waypoint_dim], jnp.float32)
+                    if self.goal_adapter_factory is not None
+                    else None
+                ),
+                goal_waypoint_mask=(
+                    jax.ShapeDtypeStruct([batch_size, self.max_goal_waypoints], jnp.bool_)
+                    if self.goal_adapter_factory is not None
+                    else None
+                ),
             )
         action_spec = jax.ShapeDtypeStruct([batch_size, self.action_horizon, self.action_dim], jnp.float32)
 
