@@ -17,7 +17,6 @@ dependencies = [
     "imageio>=2.36.1",
     "jax[cuda12]==0.5.3",
     "jaxtyping==0.2.36",
-    "lerobot",
     "ml_collections==1.0.0",
     "numpy>=1.22.4,<2.0.0",
     "numpydantic>=1.6.6",
@@ -40,6 +39,10 @@ dependencies = [
     "polars>=1.30.0",
 ]
 
+[project.optional-dependencies]
+lerobot = [
+    "lerobot @ git+https://github.com/huggingface/lerobot@0cf864870cf29f4738d3ade893e6fd13fbd7cdb5",
+]
 
 [project.urls]
 Repository = "https://github.com/Physical-Intelligence/openpi"

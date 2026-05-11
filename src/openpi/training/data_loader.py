@@ -7,7 +7,6 @@ from typing import Literal, Protocol, SupportsIndex, TypeVar
 
 import jax
 import jax.numpy as jnp
-import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
 import numpy as np
 import torch
 
@@ -136,6 +135,15 @@ def create_torch_dataset(
         raise ValueError("Repo ID is not set. Cannot create dataset.")
     if repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
+
+    try:
+        import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
+    except ImportError as exc:
+        raise ImportError(
+            "LeRobot is required for OpenPI torch datasets. Install the OpenPI "
+            "LeRobot dependency or use a custom data loader that does not call "
+            "`create_torch_dataset`."
+        ) from exc
 
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
     dataset = lerobot_dataset.LeRobotDataset(
